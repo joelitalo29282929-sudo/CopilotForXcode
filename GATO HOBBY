@@ -1,0 +1,183 @@
+-- SpeedServer (Script em ServerScriptService)
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ToggleSpeedEvent = ReplicatedStorage:WaitForChild("ToggleSpeedEvent")
+local SpeedUpdateEvent = ReplicatedStorage:WaitForChild("SpeedUpdateEvent")
+
+local BOOST_SPEED = 60        -- velocidade quando ativado (ajuste)
+local NORMAL_SPEED = 16       -- velocidade normal do jogador (ajuste)
+local COOLDOWN = 10           -- cooldown em segundos entre trocas
+
+-- Tabela para guardar estado por player
+local playerState = {} -- [userId] = { boosted = false, lastToggle = 0 }
+
+local function ensureState(player)
+	if not playerState[player.UserId] then
+		playerState[player.UserId] = { boosted = false, lastToggle = 0 }
+	end
+	return playerState[player.UserId]
+end
+
+-- Ao jogador entrar, garante walkspeed normal
+game.Players.PlayerAdded:Connect(function(player)
+	local state = ensureState(player)
+	player.CharacterAdded:Connect(function(char)
+		local humanoid = char:WaitForChild("Humanoid", 10)
+		if humanoid then
+			humanoid.WalkSpeed = NORMAL_SPEED
+		end
+	end)
+end)
+
+-- Quando cliente pede toggle
+ToggleSpeedEvent.OnServerEvent:Connect(function(player)
+	local state = ensureState(player)
+	local now = tick()
+	local elapsed = now - state.lastToggle
+	local remaining = COOLDOWN - elapsed
+
+	-- Se estiver em cooldown, responde com falha e tempo restante
+	if remaining > 0 then
+		SpeedUpdateEvent:FireClient(player, {
+			success = false,
+			message = "Cooldown",
+			cooldownRemaining = math.ceil(remaining)
+		})
+		return
+	end
+
+	-- Alterna o estado
+	state.boosted = not state.boosted
+	state.lastToggle = now
+
+	-- Aplica ao humanoid atual (se existir)
+	local char = player.Character
+	if char and char:FindFirstChild("Humanoid") then
+		local humanoid = char.Humanoid
+		if state.boosted then
+			humanoid.WalkSpeed = BOOST_SPEED
+		else
+			humanoid.WalkSpeed = NORMAL_SPEED
+		end
+	end
+
+	-- Responde sucesso e o novo estado (client atualiza UI)
+	SpeedUpdateEvent:FireClient(player, {
+		success = true,
+		boosted = state.boosted,
+		cooldownRemaining = COOLDOWN
+	})
+end)
+-- SpeedClient (LocalScript dentro de uma ScreenGui)
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local player = Players.LocalPlayer
+
+local ToggleSpeedEvent = ReplicatedStorage:WaitForChild("ToggleSpeedEvent")
+local SpeedUpdateEvent = ReplicatedStorage:WaitForChild("SpeedUpdateEvent")
+
+-- Configurações visuais
+local screenGui = script.Parent
+if not screenGui:IsA("ScreenGui") then
+	error("Este LocalScript precisa estar dentro de uma ScreenGui")
+end
+
+-- Cria botão e label se não existirem
+local button = screenGui:FindFirstChild("SpeedButton")
+local cooldownLabel = screenGui:FindFirstChild("SpeedCooldownLabel")
+
+if not button then
+	button = Instance.new("TextButton")
+	button.Name = "SpeedButton"
+	button.Size = UDim2.new(0,160,0,48)
+	button.Position = UDim2.new(0.5, -80, 0.9, -50)
+	button.AnchorPoint = Vector2.new(0.5, 0.5)
+	button.Text = "Ativar Velocidade"
+	button.Font = Enum.Font.SourceSansBold
+	button.TextSize = 20
+	button.Parent = screenGui
+end
+
+if not cooldownLabel then
+	cooldownLabel = Instance.new("TextLabel")
+	cooldownLabel.Name = "SpeedCooldownLabel"
+	cooldownLabel.Size = UDim2.new(0,160,0,24)
+	cooldownLabel.Position = UDim2.new(0.5, -80, 0.9, -80)
+	cooldownLabel.AnchorPoint = Vector2.new(0.5, 0.5)
+	cooldownLabel.Text = ""
+	cooldownLabel.Font = Enum.Font.SourceSans
+	cooldownLabel.TextSize = 18
+	cooldownLabel.Parent = screenGui
+end
+
+local isCooldown = false
+local cooldownTime = 0
+
+-- Função para atualizar UI a cada frame (exibe contagem regressiva)
+spawn(function()
+	while true do
+		if isCooldown then
+			local remain = math.max(0, math.ceil(cooldownTime - tick()))
+			cooldownLabel.Text = "Cooldown: " .. remain .. "s"
+			if remain <= 0 then
+				isCooldown = false
+				cooldownLabel.Text = ""
+				button.Active = true
+				button.TextTransparency = 0
+			end
+		end
+		wait(0.2)
+	end
+end)
+
+-- Ao clicar no botão, envia pedido ao servidor
+button.MouseButton1Click:Connect(function()
+	-- evita spam local (UI)
+	if isCooldown then return end
+	-- desativa o botão localmente até receber resposta do servidor
+	button.Active = false
+	button.TextTransparency = 0.5
+
+	-- pede toggle
+	ToggleSpeedEvent:FireServer()
+end)
+
+-- Recebe resposta do servidor
+SpeedUpdateEvent.OnClientEvent:Connect(function(data)
+	-- data pode ser: { success = bool, boosted = bool, cooldownRemaining = number, message = "Cooldown" }
+	if not data then return end
+
+	if data.success then
+		-- atualiza texto do botão
+		if data.boosted then
+			button.Text = "Desativar Velocidade"
+		else
+			button.Text = "Ativar Velocidade"
+		end
+
+		-- inicia cooldown local
+		if data.cooldownRemaining and type(data.cooldownRemaining) == "number" then
+			isCooldown = true
+			cooldownTime = tick() + data.cooldownRemaining
+			button.Active = false
+			button.TextTransparency = 0.5
+		else
+			-- sem cooldown informado: reativa botão
+			button.Active = true
+			button.TextTransparency = 0
+		end
+	else
+		-- falha (ex.: servidor disse que ainda está em cooldown)
+		if data.cooldownRemaining then
+			isCooldown = true
+			cooldownTime = tick() + data.cooldownRemaining
+			button.Active = false
+			button.TextTransparency = 0.5
+			-- feedback rápido
+			cooldownLabel.Text = "Cooldown: " .. tostring(math.ceil(data.cooldownRemaining)) .. "s"
+		else
+			-- erro genérico: reativa botão
+			button.Active = true
+			button.TextTransparency = 0
+		end
+	end
+end)
